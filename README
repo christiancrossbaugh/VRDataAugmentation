@@ -1,0 +1,121 @@
+# TTS-CGAN for Eye Openness Data with Minimal Data Requirements Analysis
+
+This repository implements the TTS-CGAN (Transformer Time-Series Conditional GAN) method for generating synthetic time-series data, specifically focused on eye openness data. The implementation is based on the research paper "TTS-CGAN: A Transformer Time-Series Conditional GAN for Biosignal Data Augmentation" and the GitHub repository https://github.com/imics-lab/tts-cgan.
+
+## Project Overview
+
+This implementation addresses the key question from the thesis proposal:
+> How much real data is needed to effectively initiate the augmentation process without compromising model performance?
+
+The code includes:
+
+1. **TTS-CGAN Implementation**: A complete implementation of the Transformer-based Conditional GAN for time-series data.
+2. **Dynamic Time Warping (DTW) Evaluation**: Tools to assess the quality of generated synthetic data using DTW.
+3. **Minimal Data Requirements Analysis**: Experiments to determine the minimal amount of real data needed for effective augmentation.
+4. **Comparative Analysis**: Comparison of models trained with minimal vs. full data.
+
+## Requirements
+
+To run this code, you'll need:
+
+```
+numpy
+pandas
+tensorflow
+matplotlib
+scikit-learn
+dtw-python
+seaborn
+scipy
+```
+
+You can install all required packages with:
+
+```bash
+pip install numpy pandas tensorflow matplotlib scikit-learn dtw-python seaborn scipy
+```
+
+## Code Structure
+
+The implementation is organized into the following modules:
+
+- `ttscgan_implementation.py`: Core implementation of the TTS-CGAN architecture.
+- `experiment_runner.py`: Functions for running experiments with varying proportions of real data.
+- `dtw_evaluator.py`: Tools for evaluating synthetic data quality using Dynamic Time Warping.
+- `main.py`: Main script that ties everything together and runs the complete experiment.
+
+## Dataset
+
+The code is designed to work with the provided `left_eye_openness.csv` file, which contains a time series of left eye openness measurements. The data is preprocessed and divided into three classes:
+- Class 0: Closed/mostly closed eyes
+- Class 1: Partially open eyes
+- Class 2: Fully open eyes
+
+The classification is based on the average eye openness value in each sequence.
+
+## Running the Code
+
+You can run the entire experiment with the default settings:
+
+```bash
+python main.py
+```
+
+Or customize various parameters:
+
+```bash
+python main.py --data_file left_eye_openness.csv --output_dir results_experiment --epochs 300 --batch_size 32 --min_percentages 5,10,20,30,50,70 --num_trials 3
+```
+
+### Command-Line Arguments
+
+- `--data_file`: Path to the eye openness CSV file (default: 'left_eye_openness.csv')
+- `--output_dir`: Output directory (default: 'results_[timestamp]')
+- `--sequence_length`: Length of sequences to generate (default: 100)
+- `--latent_dim`: Dimension of latent space (default: 64)
+- `--epochs`: Number of training epochs (default: 300)
+- `--batch_size`: Batch size for training (default: 32)
+- `--num_classes`: Number of classes in the dataset (default: 3)
+- `--min_percentages`: Comma-separated list of percentages to test (default: '5,10,20,30,50,70')
+- `--num_trials`: Number of trials for each percentage (default: 3)
+- `--mode`: Experiment mode: 'full' (all experiments), 'minimal' (just minimal data analysis), or 'comparative' (just comparative analysis) (default: 'full')
+
+## Experiment Stages
+
+The full experiment consists of three stages:
+
+1. **Basic TTS-CGAN Training**: Trains the TTS-CGAN model on the full dataset and evaluates the quality of the generated data.
+2. **Minimal Data Requirements Analysis**: Determines the minimal amount of real data needed for effective augmentation by training models with varying amounts of real data.
+3. **Comparative Analysis**: Compares models trained with the recommended minimal data vs. full data to quantify the trade-offs.
+
+## Output
+
+The experiment generates the following outputs:
+
+- Generated synthetic sequences for each class
+- DTW and Wasserstein distance evaluations
+- Training history plots
+- Comparative analysis results
+- Minimal data requirements analysis
+- Recommendation for the minimal amount of real data needed
+
+## Analyzing Results
+
+The key results to examine are:
+
+1. **Minimal Data Threshold**: The recommended percentage of real data (found in `minimal_data_analysis/recommendation.txt`).
+2. **Efficiency Results**: The trade-off between data reduction and synthetic data quality (found in `comparative_analysis/efficiency_results.csv`).
+3. **DTW Evaluations**: The distance matrices and alignment visualizations in the `dtw_evaluation` directories.
+
+## Extending for Other Datasets
+
+To use this code with other time-series datasets:
+
+1. Modify the `load_and_preprocess_data` function in `ttscgan_implementation.py` to handle your specific data format.
+2. Adjust the number of classes and sequence length as needed.
+3. Run the experiments with appropriate parameters.
+
+## Acknowledgments
+
+- Original TTS-CGAN implementation: https://github.com/imics-lab/tts-cgan
+- Based on the paper: "TTS-CGAN: A Transformer Time-Series Conditional GAN for Biosignal Data Augmentation"

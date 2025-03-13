@@ -1,0 +1,10 @@
+data_file: left_eye_openness.csv
+output_dir: results_20250313_094028
+sequence_length: 100
+latent_dim: 64
+epochs: 300
+batch_size: 32
+num_classes: 3
+min_percentages: 5,10,20,30,50,70
+num_trials: 3
+mode: full
