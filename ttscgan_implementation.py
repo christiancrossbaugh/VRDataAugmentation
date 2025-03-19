@@ -11,6 +11,29 @@ from dtw import dtw
 from numpy.linalg import norm
 import seaborn as sns
 from scipy.stats import wasserstein_distance
+from dtaidistance import dtw
+from dtaidistance import preprocessing
+from fastdtw import fastdtw
+from scipy.spatial.distance import euclidean
+
+# Configure GPU memory growth
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(e)
+
+# Add dataset prefetching
+AUTOTUNE = tf.data.AUTOTUNE
+
+def create_dataset(x_train, y_train, batch_size):
+    dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    dataset = dataset.shuffle(buffer_size=len(x_train))
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(AUTOTUNE)
+    return dataset
 
 # Set random seed for reproducibility
 tf.random.set_seed(42)
@@ -18,17 +41,33 @@ np.random.seed(42)
 
 # Global parameters
 SEQUENCE_LENGTH = 50  # Length of time sequence to generate
-LATENT_DIM = 64  # Dimension of noise input to generator
-BATCH_SIZE = 32
-EPOCHS = 300
+LATENT_DIM = 128  # Dimension of noise input to generator
+BATCH_SIZE = 64
+EPOCHS = 200
+NUM_TRANSFORMER_BLOCKS = 4
+NUM_ATTENTION_HEADS = 8
+EMBEDDING_DIM = 256
+FF_DIM = EMBEDDING_DIM * 4  # Feed-forward dimension
+DROPOUT_RATE = 0.2
+LEARNING_RATE_GENERATOR = 0.0001
+LEARNING_RATE_DISCRIMINATOR = 0.0002
+GRADIENT_PENALTY_WEIGHT = 15.0
+DISCRIMINATOR_UPDATES = 3
+
+LEARNING_RATE_DECAY = 0.95            # Learning rate decay factor
+DECAY_STEPS = 1000                    # Steps before decay
+WARMUP_EPOCHS = 5                     # Gradual warmup
+BATCH_ACCUMULATION = 4                # Effective batch size = 64 * 4
+
+"""
+Sample test configuration for the TTS-CGAN model
+EMBEDDING_DIM = 128
 NUM_TRANSFORMER_BLOCKS = 3
 NUM_ATTENTION_HEADS = 8
-EMBEDDING_DIM = 128
-FF_DIM = EMBEDDING_DIM * 4  # Feed-forward dimension
 DROPOUT_RATE = 0.1
 LEARNING_RATE_GENERATOR = 0.0002
 LEARNING_RATE_DISCRIMINATOR = 0.0002
-
+"""
 # Positional Encoding
 def positional_encoding(length, depth):
     """
@@ -47,30 +86,18 @@ def positional_encoding(length, depth):
     
     return tf.cast(pos_encoding, dtype=tf.float32)
 
-# Custom Transformer Block for the Generator and Discriminator
-# Add these constants at the top of the file
-EMBEDDING_DIM = 128
-NUM_TRANSFORMER_BLOCKS = 3
-NUM_ATTENTION_HEADS = 8
-DROPOUT_RATE = 0.1
-LEARNING_RATE_GENERATOR = 0.0002
-LEARNING_RATE_DISCRIMINATOR = 0.0002
-
 def build_generator(latent_dim, sequence_length, num_features, num_classes):
-    """
-    Build the Transformer-based Generator model
-    """
-    # Noise input
+    """Build the Transformer-based Generator model"""
+    # All layers explicitly set as trainable
     noise_input = keras.Input(shape=(latent_dim,), name="noise_input")
-    
-    # Label input
     label_input = keras.Input(shape=(num_classes,), name="label_input")
     
-    # Concatenate noise and label
     combined_input = layers.Concatenate()([noise_input, label_input])
     
-    # Make sure all layers are trainable
-    x = layers.Dense(sequence_length * EMBEDDING_DIM, trainable=True)(combined_input)
+    x = layers.Dense(sequence_length * EMBEDDING_DIM, trainable=True,
+                    kernel_initializer='glorot_uniform')(combined_input)
+    x = layers.BatchNormalization(trainable=True)(x)
+    x = layers.LeakyReLU(0.2)(x)
     x = layers.Reshape((sequence_length, EMBEDDING_DIM))(x)
     
     # Add positional encoding
@@ -79,55 +106,85 @@ def build_generator(latent_dim, sequence_length, num_features, num_classes):
     pos_enc = tf.expand_dims(pos_enc, 0)
     x = x + pos_enc
     
-    # Transformer encoder blocks
-    for _ in range(NUM_TRANSFORMER_BLOCKS):
+    # Transformer blocks
+    for i in range(NUM_TRANSFORMER_BLOCKS):
         x = transformer_encoder_block(
             inputs=x,
             num_heads=NUM_ATTENTION_HEADS,
             key_dim=EMBEDDING_DIM // NUM_ATTENTION_HEADS,
             dropout_rate=DROPOUT_RATE,
-            trainable=True  # Make sure blocks are trainable
+            trainable=True,
+            name=f'generator_transformer_block_{i}'
         )
     
-    # Output layer
-    x = layers.Dense(num_features, trainable=True)(x)
+    output = layers.Dense(num_features, trainable=True,
+                         kernel_initializer='glorot_uniform')(x)
     
-    # Create model
-    model = keras.Model([noise_input, label_input], x, name="generator")
+    model = keras.Model([noise_input, label_input], output, name="generator")
     
-    # Ensure all layers are trainable
+    # Explicitly set all layers as trainable
     for layer in model.layers:
         layer.trainable = True
     
     return model
 
-def transformer_encoder_block(inputs, num_heads, key_dim, dropout_rate, trainable=True):
+def transformer_encoder_block(inputs, num_heads, key_dim, dropout_rate, trainable=True, name='transformer_block'):
     """
-    Transformer encoder block with trainable layers
+    Transformer encoder block with explicit trainable settings
     """
     # Layer normalization
-    x = layers.LayerNormalization(epsilon=1e-6, trainable=trainable)(inputs)
+    x = layers.LayerNormalization(
+        epsilon=1e-6, 
+        trainable=trainable,
+        name=f'{name}_norm1'
+    )(inputs)
     
     # Multi-head self-attention
     attention_output = layers.MultiHeadAttention(
         num_heads=num_heads, 
         key_dim=key_dim,
         dropout=dropout_rate,
-        trainable=trainable
+        trainable=trainable,
+        name=f'{name}_attention'
     )(x, x)
     
-    # Add & Norm
-    attention_output = layers.Dropout(dropout_rate)(attention_output)
-    x1 = layers.Add()([inputs, attention_output])
+    # Add & Norm with dropout
+    attention_output = layers.Dropout(
+        dropout_rate,
+        name=f'{name}_dropout1'
+    )(attention_output)
+    x1 = layers.Add(name=f'{name}_add1')([inputs, attention_output])
     
     # Feed-forward network
-    x2 = layers.LayerNormalization(epsilon=1e-6, trainable=trainable)(x1)
-    x2 = layers.Dense(EMBEDDING_DIM * 4, activation='gelu', trainable=trainable)(x2)
-    x2 = layers.Dense(EMBEDDING_DIM, trainable=trainable)(x2)
-    x2 = layers.Dropout(dropout_rate)(x2)
+    x2 = layers.LayerNormalization(
+        epsilon=1e-6, 
+        trainable=trainable,
+        name=f'{name}_norm2'
+    )(x1)
     
-    # Add & Norm
-    return layers.Add()([x1, x2])
+    # Two dense layers with GELU activation
+    x2 = layers.Dense(
+        EMBEDDING_DIM * 4, 
+        activation='gelu',
+        trainable=trainable,
+        kernel_initializer='glorot_uniform',
+        name=f'{name}_dense1'
+    )(x2)
+    
+    x2 = layers.Dense(
+        EMBEDDING_DIM,
+        trainable=trainable,
+        kernel_initializer='glorot_uniform',
+        name=f'{name}_dense2'
+    )(x2)
+    
+    x2 = layers.Dropout(
+        dropout_rate,
+        name=f'{name}_dropout2'
+    )(x2)
+    
+    # Final Add & Norm
+    return layers.Add(name=f'{name}_add2')([x1, x2])
 
 # Discriminator Model
 def build_discriminator(sequence_length, num_features, num_classes):
@@ -141,30 +198,79 @@ def build_discriminator(sequence_length, num_features, num_classes):
     pos_enc = positional_encoding(sequence_length, num_features)
     x = sequence_input + pos_enc[:, :num_features]
     
-    # Project to higher dimension for transformer
-    x = layers.Dense(EMBEDDING_DIM)(x)
+    # Initial dense projection with explicit trainable setting
+    x = layers.Dense(EMBEDDING_DIM, 
+                    trainable=True,
+                    kernel_initializer='glorot_uniform',
+                    name='initial_projection')(x)
+    x = layers.BatchNormalization(trainable=True)(x)
+    x = layers.LeakyReLU(0.2)(x)
     
-    # Transformer encoder blocks
-    for _ in range(NUM_TRANSFORMER_BLOCKS):
+    # Transformer encoder blocks with explicit trainable settings
+    for i in range(NUM_TRANSFORMER_BLOCKS):
         x = transformer_encoder_block(
             inputs=x,
             num_heads=NUM_ATTENTION_HEADS,
             key_dim=EMBEDDING_DIM // NUM_ATTENTION_HEADS,
-            dropout_rate=DROPOUT_RATE
+            dropout_rate=DROPOUT_RATE,
+            trainable=True,
+            name=f'discriminator_transformer_block_{i}'
         )
+        # Add batch normalization after each transformer block
+        x = layers.BatchNormalization(trainable=True,
+                                    name=f'bn_after_transformer_{i}')(x)
     
     # Global average pooling
     x = layers.GlobalAveragePooling1D()(x)
     
-    # Dual heads:
+    # Dense layers before heads with explicit trainable setting
+    x = layers.Dense(512, trainable=True,
+                    kernel_initializer='glorot_uniform',
+                    name='pre_head_dense')(x)
+    x = layers.BatchNormalization(trainable=True,
+                                name='pre_head_bn')(x)
+    x = layers.LeakyReLU(0.2)(x)
+    x = layers.Dropout(DROPOUT_RATE)(x)
+    
+    # Dual heads with explicit trainable settings:
     # 1. Real/Fake classification
-    adversarial_output = layers.Dense(1, activation="sigmoid", name="adversarial")(x)
+    adversarial_head = layers.Dense(256, trainable=True,
+                                  kernel_initializer='glorot_uniform',
+                                  name='adversarial_dense')(x)
+    adversarial_head = layers.LeakyReLU(0.2)(adversarial_head)
+    adversarial_head = layers.Dropout(DROPOUT_RATE)(adversarial_head)
+    adversarial_output = layers.Dense(1, 
+                                    activation="sigmoid",
+                                    trainable=True,
+                                    kernel_initializer='glorot_uniform',
+                                    name="adversarial")(adversarial_head)
     
     # 2. Class prediction
-    classifier_output = layers.Dense(num_classes, activation="softmax", name="classifier")(x)
+    classifier_head = layers.Dense(256, trainable=True,
+                                 kernel_initializer='glorot_uniform',
+                                 name='classifier_dense')(x)
+    classifier_head = layers.LeakyReLU(0.2)(classifier_head)
+    classifier_head = layers.Dropout(DROPOUT_RATE)(classifier_head)
+    classifier_output = layers.Dense(num_classes, 
+                                   activation="softmax",
+                                   trainable=True,
+                                   kernel_initializer='glorot_uniform',
+                                   name="classifier")(classifier_head)
     
     # Create model
-    model = keras.Model(sequence_input, [adversarial_output, classifier_output], name="discriminator")
+    model = keras.Model(sequence_input, 
+                       [adversarial_output, classifier_output], 
+                       name="discriminator")
+    
+    # Explicitly set all layers as trainable
+    for layer in model.layers:
+        layer.trainable = True
+        print(f"Setting {layer.name} as trainable")
+    
+    # Verify trainable weights
+    trainable_count = len(model.trainable_weights)
+    print(f"\nDiscriminator has {trainable_count} trainable weights")
+    
     return model
 
 # Wasserstein loss with gradient penalty
@@ -196,6 +302,19 @@ def gradient_penalty(discriminator, real_samples, fake_samples):
     
     return penalty
 
+def get_learning_rate_schedule(initial_lr, decay_steps, decay_rate):
+    """Create learning rate schedule with warmup"""
+    def lr_schedule(epoch):
+        # Warmup phase
+        if epoch < WARMUP_EPOCHS:
+            return initial_lr * ((epoch + 1) / WARMUP_EPOCHS)
+        
+        # Decay phase
+        decay_epoch = epoch - WARMUP_EPOCHS
+        return initial_lr * (decay_rate ** (decay_epoch // decay_steps))
+    
+    return lr_schedule
+
 # TTS-CGAN Class
 class TTSCGAN:
     def __init__(self, sequence_length, num_features, num_classes, latent_dim):
@@ -204,23 +323,38 @@ class TTSCGAN:
         self.num_classes = num_classes
         self.latent_dim = latent_dim
 
-        # Build models
+        # Build models with explicit trainable settings
         self.generator = build_generator(latent_dim, sequence_length, num_features, num_classes)
         self.discriminator = build_discriminator(sequence_length, num_features, num_classes)
 
-        # Ensure models are trainable
-        self.generator.trainable = True
-        self.discriminator.trainable = True
+        # Explicitly set layers as trainable
+        for layer in self.generator.layers:
+            layer.trainable = True
+        for layer in self.discriminator.layers:
+            layer.trainable = True
 
-        # Compile discriminator
+        # Compile discriminator with explicit trainable setting
+        self.discriminator.trainable = True
         self.discriminator.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE_DISCRIMINATOR, beta_1=0.9, beta_2=0.999),
+            optimizer=keras.optimizers.Adam(
+                learning_rate=LEARNING_RATE_DISCRIMINATOR, 
+                beta_1=0.9, 
+                beta_2=0.999
+            ),
             loss=[wasserstein_loss, "categorical_crossentropy"],
             loss_weights=[1.0, 1.0]
         )
 
+         # Add learning rate schedulers
+        self.g_lr_schedule = get_learning_rate_schedule(
+            LEARNING_RATE_GENERATOR, DECAY_STEPS, LEARNING_RATE_DECAY
+        )
+        self.d_lr_schedule = get_learning_rate_schedule(
+            LEARNING_RATE_DISCRIMINATOR, DECAY_STEPS, LEARNING_RATE_DECAY
+        )
+
         # Build combined model for generator training
-        self.discriminator.trainable = False  # Freeze discriminator weights when training generator
+        self.discriminator.trainable = False  # Freeze discriminator for generator training
         noise_input = keras.Input(shape=(latent_dim,))
         label_input = keras.Input(shape=(num_classes,))
         generated_sequence = self.generator([noise_input, label_input])
@@ -228,35 +362,58 @@ class TTSCGAN:
 
         self.combined = keras.Model([noise_input, label_input], [valid, target_label])
         self.combined.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE_GENERATOR, beta_1=0.9, beta_2=0.999),
+            optimizer=keras.optimizers.Adam(
+                learning_rate=LEARNING_RATE_GENERATOR, 
+                beta_1=0.9, 
+                beta_2=0.999
+            ),
             loss=[wasserstein_loss, "categorical_crossentropy"],
             loss_weights=[1.0, 1.0]
         )
 
-        # Make sure layers are trainable
+        # Print model information
+        print("\nModel Trainable Parameters:")
+        print("Generator trainable weights:", len(self.generator.trainable_weights))
+        print("Discriminator trainable weights:", len(self.discriminator.trainable_weights))
+        print("Combined model trainable weights:", len(self.combined.trainable_weights))
+
+        print("\nGenerator layers:")
         for layer in self.generator.layers:
-            layer.trainable = True
+            print(f"{layer.name}: trainable = {layer.trainable}, weights = {len(layer.trainable_weights)}")
+
+        print("\nDiscriminator layers:")
         for layer in self.discriminator.layers:
-            layer.trainable = True
+            print(f"{layer.name}: trainable = {layer.trainable}, weights = {len(layer.trainable_weights)}")
     
     def train(self, x_train, y_train, epochs, batch_size, save_interval=50, output_dir='output'):
         # Add check for trainable weights
         generator_trainable = any(layer.trainable for layer in self.generator.layers)
         discriminator_trainable = any(layer.trainable for layer in self.discriminator.layers)
-        
+
+        # Print training configuration
+        print("\nTraining Configuration:")
+        print(f"Generator learning rate: {LEARNING_RATE_GENERATOR}")
+        print(f"Discriminator learning rate: {LEARNING_RATE_DISCRIMINATOR}")
+        print(f"Batch size: {batch_size}")
+        print(f"Batch accumulation steps: {BATCH_ACCUMULATION}")
+        print(f"Effective batch size: {batch_size * BATCH_ACCUMULATION}")
+        print(f"Epochs: {epochs}")
+        print(f"Training samples: {len(x_train)}")
+
         if not generator_trainable or not discriminator_trainable:
             print("Warning: Some model components are not trainable!")
             print(f"Generator trainable: {generator_trainable}")
             print(f"Discriminator trainable: {discriminator_trainable}")
-            
+
             # Print trainable status of each layer
             print("\nGenerator layers:")
             for layer in self.generator.layers:
                 print(f"{layer.name}: trainable = {layer.trainable}")
-            
+
             print("\nDiscriminator layers:")
             for layer in self.discriminator.layers:
                 print(f"{layer.name}: trainable = {layer.trainable}")
+
         ##Train the TTS-CGAN model##
         # Create directories for output
         os.makedirs(output_dir, exist_ok=True)
@@ -279,53 +436,71 @@ class TTSCGAN:
                 # Train discriminator
                 d_loss_epoch = []
 
-                for _ in range(n_critic):
-                    # Select a random batch of real sequences
-                    idx = np.random.randint(0, x_train.shape[0], batch_size)
-                    real_seqs = x_train[idx]
-                    real_labels = y_train[idx]
+                # Batch accumulation loop
+                d_loss_accumulated = None
+                g_loss_accumulated = None
 
-                    # Generate random noise
-                    noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+                for acc_step in range(BATCH_ACCUMULATION):
+                    for _ in range(n_critic):
+                        # Select a random batch of real sequences
+                        idx = np.random.randint(0, x_train.shape[0], batch_size)
+                        real_seqs = x_train[idx]
+                        real_labels = y_train[idx]
 
-                    # Generate fake sequences
-                    gen_seqs = self.generator.predict([noise, real_labels], verbose=0)
+                        # Generate random noise
+                        noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
 
-                    # Train discriminator
-                    d_loss_real = self.discriminator.train_on_batch(
-                        real_seqs, 
-                        [np.ones((batch_size, 1)), real_labels]
-                    )
+                        # Generate fake sequences
+                        gen_seqs = self.generator.predict([noise, real_labels], verbose=0)
 
-                    d_loss_fake = self.discriminator.train_on_batch(
-                        gen_seqs, 
-                        [np.zeros((batch_size, 1)), real_labels]
-                    )
+                        # Train discriminator
+                        d_loss_real = self.discriminator.train_on_batch(
+                            real_seqs,
+                            [np.ones((batch_size, 1)), real_labels]
+                        )
+                        d_loss_fake = self.discriminator.train_on_batch(
+                            gen_seqs,
+                            [np.zeros((batch_size, 1)), real_labels]
+                        )
 
-                    # Calculate discriminator loss
-                    d_loss = [
-                        0.5 * (d_loss_real[0] + d_loss_fake[0]),  # adversarial loss
-                        0.5 * (d_loss_real[1] + d_loss_fake[1])   # classification loss
-                    ]
-                    d_loss_epoch.append(d_loss)
+                        # Calculate discriminator loss
+                        d_loss = [
+                            0.5 * (d_loss_real[0] + d_loss_fake[0]),  # adversarial loss
+                            0.5 * (d_loss_real[1] + d_loss_fake[1])   # classification loss
+                        ]
 
-                # Train generator
-                g_loss_epoch = []
+                        # Accumulate losses
+                        if d_loss_accumulated is None:
+                            d_loss_accumulated = np.array(d_loss) / BATCH_ACCUMULATION
+                        else:
+                            d_loss_accumulated += np.array(d_loss) / BATCH_ACCUMULATION
 
-                for _ in range(n_critic):
-                    # Generate random noise
-                    noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
-
-                    # Select random labels
-                    idx = np.random.randint(0, x_train.shape[0], batch_size)
-                    sampled_labels = y_train[idx]
+                    d_loss_epoch.append(d_loss_accumulated)
 
                     # Train generator
-                    g_loss = self.combined.train_on_batch(
-                        [noise, sampled_labels],
-                        [np.ones((batch_size, 1)), sampled_labels]
-                    )
-                    g_loss_epoch.append(g_loss)
+                    g_loss_epoch = []
+
+                    for _ in range(n_critic):
+                        # Generate random noise
+                        noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+
+                        # Select random labels
+                        idx = np.random.randint(0, x_train.shape[0], batch_size)
+                        sampled_labels = y_train[idx]
+
+                        # Train generator
+                        g_loss = self.combined.train_on_batch(
+                            [noise, sampled_labels],
+                            [np.ones((batch_size, 1)), sampled_labels]
+                        )
+
+                        # Accumulate generator losses
+                        if g_loss_accumulated is None:
+                            g_loss_accumulated = np.array(g_loss) / BATCH_ACCUMULATION
+                        else:
+                            g_loss_accumulated += np.array(g_loss) / BATCH_ACCUMULATION
+
+                    g_loss_epoch.append(g_loss_accumulated)
 
                 # Calculate average losses for this epoch
                 d_loss_avg = np.mean(d_loss_epoch, axis=0)
@@ -394,6 +569,23 @@ class TTSCGAN:
         plt.savefig(f"{output_dir}/generated_sequences_epoch_{epoch}.png")
         plt.close()
     
+    def gradient_penalty(self, real_samples, fake_samples):
+        batch_size = real_samples.shape[0]
+        alpha = np.random.random((batch_size, 1, 1))
+        interpolated = alpha * real_samples + (1 - alpha) * fake_samples
+
+        with tf.GradientTape() as tape:
+            tape.watch(interpolated)
+            validity, _ = self.discriminator(interpolated)
+
+        gradients = tape.gradient(validity, interpolated)[0]
+        gradients_sqr = K.square(gradients)
+        gradients_sqr_sum = K.sum(gradients_sqr, axis=np.arange(1, len(gradients_sqr.shape)))
+        gradient_l2_norm = K.sqrt(gradients_sqr_sum)
+        gradient_penalty = K.square(1 - gradient_l2_norm)
+
+        return K.mean(gradient_penalty)
+
     def generate_synthetic_sequences(self, num_sequences, class_idx, scaler=None):
         """
         Generate synthetic sequences for a specific class
@@ -493,22 +685,32 @@ def evaluate_with_dtw(real_data, synthetic_data, num_samples=10):
     """
     Evaluate the similarity between real and synthetic data using DTW
     """
-    dtw_distances = []
-    
-    # Select random samples from both datasets
-    real_indices = np.random.choice(len(real_data), num_samples, replace=False)
-    synthetic_indices = np.random.choice(len(synthetic_data), num_samples, replace=False)
-    
-    for i, j in zip(real_indices, synthetic_indices):
-        real_seq = real_data[i].flatten()
-        synthetic_seq = synthetic_data[j].flatten()
+    try:
+        dtw_distances = []
         
-        # Apply Dynamic Time Warping
-        distance, path = dtw(real_seq, synthetic_seq, dist=lambda x, y: norm(x - y))
-        dtw_distances.append(distance)
-    
-    return np.mean(dtw_distances), dtw_distances
-
+        # Select random samples
+        real_indices = np.random.choice(len(real_data), num_samples, replace=False)
+        synthetic_indices = np.random.choice(len(synthetic_data), num_samples, replace=False)
+        
+        for i, j in zip(real_indices, synthetic_indices):
+            # Flatten and normalize sequences
+            real_seq = preprocessing.normalize(real_data[i].flatten())
+            synthetic_seq = preprocessing.normalize(synthetic_data[j].flatten())
+            
+            # Convert to correct dtype
+            real_seq = real_seq.astype(np.double)
+            synthetic_seq = synthetic_seq.astype(np.double)
+            
+            # Compute DTW distance
+            distance = dtw.distance(real_seq, synthetic_seq)
+            dtw_distances.append(distance)
+        
+        mean_distance = np.mean(dtw_distances)
+        return mean_distance, dtw_distances
+        
+    except Exception as e:
+        print(f"Error in DTW evaluation: {str(e)}")
+        return None, None
 def calculate_wasserstein_distance(real_data, synthetic_data, num_samples=10):
     """
     Calculate the Wasserstein distance between real and synthetic distributions
@@ -531,237 +733,246 @@ def calculate_wasserstein_distance(real_data, synthetic_data, num_samples=10):
 
 def compare_real_synthetic_sequences(real_data, synthetic_data, scaler=None, num_samples=5, output_dir='output'):
     """
-    Compare and visualize real and synthetic sequences
+    Compare and visualize real vs synthetic sequences
     """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Select random samples to visualize
-    real_indices = np.random.choice(len(real_data), num_samples, replace=False)
-    synthetic_indices = np.random.choice(len(synthetic_data), num_samples, replace=False)
-    
-    plt.figure(figsize=(15, 10))
-    
-    # Plot real data
-    for i, idx in enumerate(real_indices):
-        plt.subplot(2, num_samples, i+1)
-        plt.plot(real_data[idx], 'b-', label='Real')
-        plt.title(f"Real Sequence {idx}")
-        plt.ylim(-1.1, 1.1)
-    
-    # Plot synthetic data
-    for i, idx in enumerate(synthetic_indices):
-        plt.subplot(2, num_samples, num_samples+i+1)
-        plt.plot(synthetic_data[idx], 'r-', label='Synthetic')
-        plt.title(f"Synthetic Sequence {idx}")
-        plt.ylim(-1.1, 1.1)
-    
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/real_vs_synthetic_comparison.png")
-    plt.close()
-
-    # Also create a direct comparison for DTW
-    plt.figure(figsize=(15, 10))
-    
-    for i in range(min(5, num_samples)):
-        plt.subplot(2, 3, i+1)
-        plt.plot(real_data[real_indices[i]], 'b-', label='Real')
-        plt.plot(synthetic_data[synthetic_indices[i]], 'r-', label='Synthetic')
-        plt.title(f"Comparison {i+1}")
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Select random samples
+        real_indices = np.random.choice(len(real_data), num_samples, replace=False)
+        synthetic_indices = np.random.choice(len(synthetic_data), num_samples, replace=False)
+        
+        dtw_distances = []
+        
+        for idx, (real_idx, syn_idx) in enumerate(zip(real_indices, synthetic_indices)):
+            # Get sequences
+            real_seq = real_data[real_idx].flatten()
+            synthetic_seq = synthetic_data[syn_idx].flatten()
+            
+            # Compute DTW
+            distance, path = fastdtw(real_seq, synthetic_seq, dist=euclidean)
+            dtw_distances.append(distance)
+            
+            # Create visualization
+            plt.figure(figsize=(15, 5))
+            
+            # Plot sequences
+            plt.subplot(1, 2, 1)
+            plt.plot(real_seq, 'b-', label='Real')
+            plt.plot(synthetic_seq, 'r--', label='Synthetic')
+            plt.title(f'Sequence Comparison (DTW Distance: {distance:.4f})')
+            plt.legend()
+            plt.grid(True)
+            
+            # Plot DTW path
+            plt.subplot(1, 2, 2)
+            # Create distance matrix for visualization
+            n = len(real_seq)
+            m = len(synthetic_seq)
+            dist_matrix = np.zeros((n, m))
+            for i in range(n):
+                for j in range(m):
+                    dist_matrix[i, j] = euclidean(real_seq[i], synthetic_seq[j])
+            
+            plt.imshow(dist_matrix, origin='lower', cmap='viridis', aspect='auto')
+            plt.plot([x[1] for x in path], [x[0] for x in path], 'w-', linewidth=2)
+            plt.title('DTW Alignment Path')
+            plt.colorbar(label='Distance')
+            
+            plt.tight_layout()
+            plt.savefig(f'{output_dir}/comparison_{idx}.png')
+            plt.close()
+        
+        # Plot DTW distance distribution
+        plt.figure(figsize=(8, 5))
+        plt.hist(dtw_distances, bins=20, alpha=0.7)
+        plt.axvline(np.mean(dtw_distances), color='r', linestyle='--', 
+                   label=f'Mean: {np.mean(dtw_distances):.4f}')
+        plt.title('DTW Distance Distribution')
+        plt.xlabel('DTW Distance')
+        plt.ylabel('Frequency')
         plt.legend()
-        plt.ylim(-1.1, 1.1)
-    
-    # Calculate and plot DTW alignment for one example
-    real_seq = real_data[real_indices[0]].flatten()
-    synthetic_seq = synthetic_data[synthetic_indices[0]].flatten()
-    
-    distance, path = dtw(real_seq, synthetic_seq, dist=lambda x, y: norm(x - y))
-    
-    plt.subplot(2, 3, 6)
-    plt.plot(path[0], 'b-', label='Path Index Real')
-    plt.plot(path[1], 'r-', label='Path Index Synthetic')
-    plt.title(f"DTW Alignment\nDistance: {distance:.4f}")
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/dtw_comparison.png")
-    plt.close()
-    
-    return real_indices, synthetic_indices
+        plt.grid(True)
+        plt.savefig(f'{output_dir}/dtw_distribution.png')
+        plt.close()
+        
+        return np.mean(dtw_distances), dtw_distances
+        
+    except Exception as e:
+        print(f"Error in sequence comparison: {str(e)}")
+        return None, None
 
-def analyze_minimal_data_requirements(dataset_path, min_percentages, sequence_length=SEQUENCE_LENGTH, 
-                                    num_classes=3, latent_dim=LATENT_DIM, epochs=EPOCHS, 
-                                    batch_size=BATCH_SIZE, output_dir='output'):
-    """
-    Analyze the minimal amount of real data required for effective data augmentation
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Load and preprocess data
-    sequences, labels, scaler = load_and_preprocess_data(dataset_path, sequence_length, num_classes)
-    
-    # Reserve a test set (20% of the data)
-    x_train_full, x_test, y_train_full, y_test = train_test_split(
-        sequences, labels, test_size=0.2, random_state=42
-    )
-    
-    # Results tracking
-    results = []
-    
-    # Train models with varying amounts of real data
-    for percentage in min_percentages:
-        print(f"\nTraining with {percentage}% of real data:")
-        
-        # Calculate the number of samples to use
-        num_samples = int(len(x_train_full) * percentage / 100)
-        
-        if num_samples < batch_size:
-            print(f"Warning: Sample size {num_samples} is less than batch size {batch_size}.")
-            print("Using smallest possible batch size.")
-            current_batch_size = max(1, num_samples // 2)
-        else:
-            current_batch_size = batch_size
-        
-        # Subsample the training data
-        indices = np.random.choice(len(x_train_full), num_samples, replace=False)
-        x_train = x_train_full[indices]
-        y_train = y_train_full[indices]
-        
-        print(f"Training with {len(x_train)} real samples")
-        
-        # Initialize and train the TTS-CGAN model
-        num_features = x_train.shape[2]
-        
-        ttscgan = TTSCGAN(
-            sequence_length=sequence_length,
-            num_features=num_features,
-            num_classes=num_classes,
-            latent_dim=latent_dim
-        )
-        
-        # Train the model
-        d_losses, g_losses = ttscgan.train(
-            x_train=x_train, 
-            y_train=y_train,
-            epochs=epochs,
-            batch_size=current_batch_size,
-            save_interval=100,
-            output_dir=f"{output_dir}/{percentage}_percent"
-        )
-        
-        # Generate synthetic data for evaluation
-        synthetic_data_all = []
-        
-        for class_idx in range(num_classes):
-            synthetic_data = ttscgan.generate_synthetic_sequences(
-                num_sequences=100,
-                class_idx=class_idx
-            )
-            synthetic_data_all.append(synthetic_data)
-        
-        synthetic_data_all = np.vstack(synthetic_data_all)
-        
-        # Evaluate using Wasserstein distance
-    ws_mean, ws_distances = calculate_wasserstein_distance(x_test, all_synthetic)
-    print(f"Wasserstein Mean Distance: {ws_mean:.4f}")
-    
-    # Compare and visualize
-    compare_real_synthetic_sequences(
-        x_test, all_synthetic, 
-        scaler=scaler,
-        output_dir=output_dir
-    )
-    
-    # Analyze minimal data requirements
-    print("\nAnalyzing minimal data requirements...")
-    min_percentages = [5, 10, 20, 30, 50, 70]
-    results_df = analyze_minimal_data_requirements(
-        dataset_path="left_eye_openness.csv",
-        min_percentages=min_percentages,
-        sequence_length=SEQUENCE_LENGTH,
-        num_classes=num_classes,
-        latent_dim=LATENT_DIM,
-        epochs=300,  # Use fewer epochs for this analysis
-        batch_size=BATCH_SIZE,
-        output_dir=f"{output_dir}/minimal_data_analysis"
-    )
-    
-    print("\nMinimal data requirements analysis results:")
-    print(results_df)
-    
-    # Plot the minimal data requirements results
-    plt.figure(figsize=(10, 6))
-    plt.plot(results_df['percentage'], results_df['dtw_mean'], 'o-', label='DTW Distance')
-    plt.plot(results_df['percentage'], results_df['ws_mean'], 's-', label='Wasserstein Distance')
-    plt.xlabel('Percentage of Real Data')
-    plt.ylabel('Distance Metric')
-    plt.title('Effect of Real Data Percentage on Synthetic Data Quality')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(f"{output_dir}/minimal_data_requirements_summary.png")
-    plt.close()
-    
-    print("\nTraining and evaluation complete!")
+from scipy.spatial.distance import euclidean
+from fastdtw import fastdtw
+from sklearn.preprocessing import MinMaxScaler
+import numpy as np
+import matplotlib.pyplot as plt
+import os
 
-    if __name__ == "__main__":
-        main()
-        dtw_mean, dtw_distances = evaluate_with_dtw(x_test, synthetic_data_all)
+def compare_real_synthetic_sequences(real_data, synthetic_data, scaler=None, num_samples=5, output_dir='output'):
+    """
+    Compare and visualize real vs synthetic sequences
+    """
+    try:
+        os.makedirs(output_dir, exist_ok=True)
         
-        # Evaluate using Wasserstein distance
-        ws_mean, ws_distances = calculate_wasserstein_distance(x_test, synthetic_data_all)
+        # Select random samples
+        real_indices = np.random.choice(len(real_data), num_samples, replace=False)
+        synthetic_indices = np.random.choice(len(synthetic_data), num_samples, replace=False)
         
-        # Compare and visualize
-        real_indices, synthetic_indices = compare_real_synthetic_sequences(
-            x_test, synthetic_data_all, 
-            scaler=scaler,
-            output_dir=f"{output_dir}/{percentage}_percent"
-        )
+        dtw_distances = []
         
-        # Save model
-        ttscgan.save_model(f"{output_dir}/{percentage}_percent/ttscgan")
+        for idx, (real_idx, syn_idx) in enumerate(zip(real_indices, synthetic_indices)):
+            # Get sequences
+            real_seq = real_data[real_idx].flatten()
+            synthetic_seq = synthetic_data[syn_idx].flatten()
+            
+            # Compute DTW
+            distance, path = fastdtw(real_seq, synthetic_seq, dist=euclidean)
+            dtw_distances.append(distance)
+            
+            # Create visualization
+            plt.figure(figsize=(15, 5))
+            
+            # Plot sequences
+            plt.subplot(1, 2, 1)
+            plt.plot(real_seq, 'b-', label='Real')
+            plt.plot(synthetic_seq, 'r--', label='Synthetic')
+            plt.title(f'Sequence Comparison (DTW Distance: {distance:.4f})')
+            plt.legend()
+            plt.grid(True)
+            
+            # Plot DTW path
+            plt.subplot(1, 2, 2)
+            # Create distance matrix for visualization
+            n = len(real_seq)
+            m = len(synthetic_seq)
+            dist_matrix = np.zeros((n, m))
+            for i in range(n):
+                for j in range(m):
+                    dist_matrix[i, j] = euclidean(real_seq[i], synthetic_seq[j])
+            
+            plt.imshow(dist_matrix, origin='lower', cmap='viridis', aspect='auto')
+            plt.plot([x[1] for x in path], [x[0] for x in path], 'w-', linewidth=2)
+            plt.title('DTW Alignment Path')
+            plt.colorbar(label='Distance')
+            
+            plt.tight_layout()
+            plt.savefig(f'{output_dir}/comparison_{idx}.png')
+            plt.close()
         
-        # Record results
-        results.append({
-            'percentage': percentage,
-            'num_samples': num_samples,
-            'dtw_mean': dtw_mean,
-            'ws_mean': ws_mean
-        })
+        # Plot DTW distance distribution
+        plt.figure(figsize=(8, 5))
+        plt.hist(dtw_distances, bins=20, alpha=0.7)
+        plt.axvline(np.mean(dtw_distances), color='r', linestyle='--', 
+                   label=f'Mean: {np.mean(dtw_distances):.4f}')
+        plt.title('DTW Distance Distribution')
+        plt.xlabel('DTW Distance')
+        plt.ylabel('Frequency')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f'{output_dir}/dtw_distribution.png')
+        plt.close()
         
-        print(f"Results for {percentage}% of data:")
-        print(f"  DTW Distance: {dtw_mean:.4f}")
-        print(f"  Wasserstein Distance: {ws_mean:.4f}")
-    
-    # Create summary plot
-    plt.figure(figsize=(12, 6))
-    
-    percentages = [result['percentage'] for result in results]
-    dtw_means = [result['dtw_mean'] for result in results]
-    ws_means = [result['ws_mean'] for result in results]
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(percentages, dtw_means, 'bo-')
-    plt.xlabel('Percentage of Real Data')
-    plt.ylabel('DTW Distance')
-    plt.title('DTW Distance vs. Real Data Percentage')
-    plt.grid(True)
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(percentages, ws_means, 'ro-')
-    plt.xlabel('Percentage of Real Data')
-    plt.ylabel('Wasserstein Distance')
-    plt.title('Wasserstein Distance vs. Real Data Percentage')
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/minimal_data_requirements_analysis.png")
-    plt.close()
-    
-    # Create results table
-    results_df = pd.DataFrame(results)
-    results_df.to_csv(f"{output_dir}/minimal_data_requirements_results.csv", index=False)
-    
-    return results_df
+        return np.mean(dtw_distances), dtw_distances
+        
+    except Exception as e:
+        print(f"Error in sequence comparison: {str(e)}")
+        return None, None
+
+def run_minimal_data_experiment(dataset_path, min_percentages, sequence_length=100,
+                              num_classes=3, latent_dim=64, epochs=200,
+                              batch_size=32, output_dir='experiment_results',
+                              num_trials=3):
+    """
+    Run experiment with varying amounts of training data
+    """
+    try:
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        results = []
+        
+        for percentage in min_percentages:
+            print(f"\nTesting with {percentage}% of training data")
+            
+            for trial in range(num_trials):
+                print(f"Trial {trial + 1}/{num_trials}")
+                
+                # Load and preprocess data
+                sequences, labels, scaler = load_and_preprocess_data(
+                    dataset_path, sequence_length=sequence_length
+                )
+                
+                # Split data
+                train_size = int(len(sequences) * (percentage / 100))
+                indices = np.random.permutation(len(sequences))
+                train_indices = indices[:train_size]
+                test_indices = indices[train_size:]
+                
+                x_train = sequences[train_indices]
+                y_train = labels[train_indices]
+                x_test = sequences[test_indices]
+                y_test = labels[test_indices]
+                
+                # Train model
+                model = TTSCGAN(
+                    sequence_length=sequence_length,
+                    num_features=sequences.shape[2],
+                    num_classes=num_classes,
+                    latent_dim=latent_dim
+                )
+                
+                model.train(
+                    x_train=x_train,
+                    y_train=y_train,
+                    epochs=epochs,
+                    batch_size=batch_size,
+                    output_dir=f"{output_dir}/percentage_{percentage}/trial_{trial}"
+                )
+                
+                # Generate synthetic data
+                synthetic_data = []
+                samples_per_class = len(x_test) // num_classes
+                
+                for class_idx in range(num_classes):
+                    synthetic = model.generate_synthetic_sequences(
+                        num_sequences=samples_per_class,
+                        class_idx=class_idx,
+                        scaler=scaler
+                    )
+                    synthetic_data.append(synthetic)
+                
+                synthetic_data = np.vstack(synthetic_data)
+                
+                # Evaluate
+                dtw_mean, _ = evaluate_with_dtw(x_test, synthetic_data)
+                
+                results.append({
+                    'percentage': percentage,
+                    'trial': trial,
+                    'dtw_mean': dtw_mean,
+                    'train_size': train_size
+                })
+                
+        # Create results DataFrame
+        results_df = pd.DataFrame(results)
+        
+        # Calculate aggregated results
+        agg_results = results_df.groupby('percentage').agg({
+            'dtw_mean': ['mean', 'std'],
+            'train_size': 'first'
+        }).reset_index()
+        
+        # Save results
+        results_df.to_csv(f'{output_dir}/detailed_results.csv', index=False)
+        agg_results.to_csv(f'{output_dir}/aggregated_results.csv', index=False)
+        
+        return results_df, agg_results
+        
+    except Exception as e:
+        print(f"Error in minimal data experiment: {str(e)}")
+        return pd.DataFrame(), pd.DataFrame()
 
 def main():
     """

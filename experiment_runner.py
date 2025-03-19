@@ -134,6 +134,10 @@ def run_minimal_data_experiment(
             
             # Evaluate using DTW
             dtw_mean, dtw_distances = evaluate_with_dtw(x_test, synthetic_data_all)
+            if dtw_mean is None:
+                print("DTW evaluation failed")
+                dtw_mean = float('nan')
+                dtw_distances = []
             
             # Evaluate using Wasserstein distance
             ws_mean, ws_distances = calculate_wasserstein_distance(x_test, synthetic_data_all)

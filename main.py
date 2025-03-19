@@ -24,9 +24,9 @@ def main():
     parser.add_argument('--data_file', type=str, default='left_eye_openness.csv', help='Path to the eye openness CSV file')
     parser.add_argument('--output_dir', type=str, default=f'results_{datetime.now().strftime("%Y%m%d_%H%M%S")}', help='Output directory')
     parser.add_argument('--sequence_length', type=int, default=100, help='Length of sequences to generate')
-    parser.add_argument('--latent_dim', type=int, default=64, help='Dimension of latent space')
-    parser.add_argument('--epochs', type=int, default=300, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
+    parser.add_argument('--latent_dim', type=int, default=128, help='Dimension of latent space')
+    parser.add_argument('--epochs', type=int, default=200, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training')
     parser.add_argument('--num_classes', type=int, default=3, help='Number of classes in the dataset')
     parser.add_argument('--min_percentages', type=str, default='5,10,20,30,50,70', help='Comma-separated list of percentages to test')
     parser.add_argument('--num_trials', type=int, default=3, help='Number of trials for each percentage')
@@ -34,7 +34,7 @@ def main():
                         help='Experiment mode: full (all experiments), minimal (just minimal data analysis), or comparative (just comparative analysis)')
     
     args = parser.parse_args()
-    
+
     # Validate num_classes
     if args.num_classes < 1:
         raise ValueError("num_classes must be at least 1")
@@ -196,7 +196,6 @@ def main():
         minimal_dir = f"{args.output_dir}/minimal_data_analysis"
         os.makedirs(minimal_dir, exist_ok=True)
         
-        # Run minimal data requirements experiment
         results_df, agg_results = run_minimal_data_experiment(
             dataset_path=args.data_file,
             min_percentages=min_percentages,
@@ -205,9 +204,47 @@ def main():
             latent_dim=args.latent_dim,
             epochs=200,  # Use fewer epochs for this analysis
             batch_size=args.batch_size,
-            output_dir=minimal_dir,
+            output_dir=os.path.join(args.output_dir, 'minimal_data_analysis'),
             num_trials=args.num_trials
         )
+
+        # Print and plot results
+        print("\nMinimal Data Requirements Analysis Results:")
+        print("\nDetailed Results:")
+        print(results_df)
+        print("\nAggregated Results:")
+        print(agg_results)
+
+        # Plot results
+        plt.figure(figsize=(12, 6))
+
+        plt.subplot(1, 2, 1)
+        for trial in range(args.num_trials):
+            trial_data = results_df[results_df['trial'] == trial]
+            plt.plot(trial_data['percentage'], trial_data['dtw_mean'], 
+                    'o-', alpha=0.3, label=f'Trial {trial+1}')
+        plt.plot(agg_results['percentage'], agg_results['dtw_mean']['mean'], 
+                'r-', linewidth=2, label='Mean')
+        plt.fill_between(agg_results['percentage'],
+                         agg_results['dtw_mean']['mean'] - agg_results['dtw_mean']['std'],
+                         agg_results['dtw_mean']['mean'] + agg_results['dtw_mean']['std'],
+                         alpha=0.2, color='r')
+        plt.xlabel('Percentage of Training Data')
+        plt.ylabel('DTW Distance')
+        plt.title('DTW Distance vs Training Data Size')
+        plt.legend()
+        plt.grid(True)
+
+        plt.subplot(1, 2, 2)
+        plt.plot(agg_results['percentage'], agg_results['train_size'], 'bo-')
+        plt.xlabel('Percentage of Training Data')
+        plt.ylabel('Number of Training Samples')
+        plt.title('Training Set Size')
+        plt.grid(True)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.output_dir, 'minimal_data_analysis', 'results_summary.png'))
+        plt.close()
         
         # Determine recommended minimum percentage
         dtw_norm = 1 - (agg_results['dtw_mean_mean'] - agg_results['dtw_mean_mean'].min()) / \
